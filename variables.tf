@@ -36,3 +36,15 @@ variable "db_username" {
     error_message = "Database username must be between 1 and 63 characters."
   }
 }
+
+variable "frontend_domain" {
+  description = "Custom domain for the frontend (optional)"
+  type        = string
+  default     = null
+}
+
+variable "acm_certificate_arn" {
+  description = "ARN of the ACM certificate for the frontend domain (required if frontend_domain is set)"
+  type        = string
+  default     = null
+}

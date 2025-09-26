@@ -778,6 +778,32 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
   })
 }
 
+# ECS Service
+resource "aws_ecs_service" "app" {
+  name            = local.name
+  cluster         = module.ecs_cluster.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = module.vpc.private_subnets
+    security_groups = [aws_security_group.ecs_tasks.id]
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.ecs.arn
+    container_name   = local.container_name
+    container_port   = local.container_port
+  }
+
+  depends_on = [aws_lb_listener.http]
+
+  tags = {
+    Name = local.name
+  }
+}
+
 # CloudWatch Log Group
 resource "aws_cloudwatch_log_group" "ecs" {
   name              = "/ecs/${local.name}"
@@ -857,6 +883,9 @@ resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   is_ipv6_enabled     = true
   default_root_object = "index.html"
+  
+  # Configure custom domain if provided
+  aliases = var.frontend_domain != null ? [var.frontend_domain] : []
 
   default_cache_behavior {
     allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
@@ -897,7 +926,11 @@ resource "aws_cloudfront_distribution" "frontend" {
   }
 
   viewer_certificate {
-    cloudfront_default_certificate = true
+    # Use custom certificate if domain is provided, otherwise use default
+    cloudfront_default_certificate = var.frontend_domain == null
+    acm_certificate_arn           = var.frontend_domain != null ? var.acm_certificate_arn : null
+    ssl_support_method            = var.frontend_domain != null ? "sni-only" : null
+    minimum_protocol_version      = var.frontend_domain != null ? "TLSv1.2_2021" : "TLSv1"
   }
 
   tags = {
