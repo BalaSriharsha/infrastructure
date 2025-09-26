@@ -32,8 +32,14 @@ output "database_subnets" {
 ################################################################################
 
 output "rds_endpoint" {
-  description = "RDS instance endpoint"
+  description = "RDS instance endpoint (with port)"
   value       = module.rds.db_instance_endpoint
+  sensitive   = true
+}
+
+output "rds_address" {
+  description = "RDS instance address (hostname only)"
+  value       = module.rds.db_instance_address
   sensitive   = true
 }
 
@@ -182,4 +188,23 @@ output "ecs_security_group_id" {
 output "rds_security_group_id" {
   description = "ID of the RDS security group"
   value       = aws_security_group.rds.id
+}
+
+################################################################################
+# VPC Endpoints Outputs
+################################################################################
+
+output "vpc_endpoint_secretsmanager_id" {
+  description = "ID of the Secrets Manager VPC endpoint"
+  value       = aws_vpc_endpoint.secretsmanager.id
+}
+
+output "vpc_endpoint_s3_id" {
+  description = "ID of the S3 VPC endpoint"
+  value       = aws_vpc_endpoint.s3.id
+}
+
+output "vpc_endpoints_security_group_id" {
+  description = "ID of the VPC endpoints security group"
+  value       = aws_security_group.vpc_endpoints.id
 }
