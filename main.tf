@@ -727,6 +727,9 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
       {
         Effect = "Allow"
         Action = [
+          "elasticloadbalancing:RegisterTargets",
+          "elasticloadbalancing:DeregisterTargets",
+          "elasticloadbalancing:DescribeTargetHealth",
           "elbv2:RegisterTargets",
           "elbv2:DeregisterTargets",
           "elbv2:DescribeTargetHealth"
@@ -748,7 +751,20 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
       {
         Effect = "Allow"
         Action = [
-          "ec2:DescribeNetworkInterfaces"
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceAttribute",
+          "ec2:DescribeInstanceStatus"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DescribeTargetGroups",
+          "elbv2:DescribeLoadBalancers",
+          "elbv2:DescribeTargetGroups"
         ]
         Resource = "*"
       },
@@ -871,6 +887,86 @@ resource "aws_s3_bucket_policy" "frontend" {
 }
 
 ################################################################################
+# CloudFront Cache Policies
+################################################################################
+
+# Cache policy for static assets (long cache)
+resource "aws_cloudfront_cache_policy" "static_assets" {
+  name        = "${local.name}-static-assets"
+  comment     = "Cache policy for static assets with long TTL"
+  default_ttl = 31536000  # 1 year
+  max_ttl     = 31536000  # 1 year
+  min_ttl     = 31536000  # 1 year
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    enable_accept_encoding_brotli = true
+    enable_accept_encoding_gzip   = true
+
+    query_strings_config {
+      query_string_behavior = "none"
+    }
+
+    headers_config {
+      header_behavior = "none"
+    }
+
+    cookies_config {
+      cookie_behavior = "none"
+    }
+  }
+}
+
+# Cache policy for index.html and dynamic content (short cache)
+resource "aws_cloudfront_cache_policy" "default" {
+  name        = "${local.name}-default"
+  comment     = "Cache policy for index.html and dynamic content with short TTL"
+  default_ttl = 60      # 1 minute
+  max_ttl     = 86400   # 1 day
+  min_ttl     = 0
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    enable_accept_encoding_brotli = true
+    enable_accept_encoding_gzip   = true
+
+    query_strings_config {
+      query_string_behavior = "none"
+    }
+
+    headers_config {
+      header_behavior = "whitelist"
+      headers {
+        items = ["CloudFront-Viewer-Country"]
+      }
+    }
+
+    cookies_config {
+      cookie_behavior = "none"
+    }
+  }
+}
+
+# Origin request policy
+resource "aws_cloudfront_origin_request_policy" "default" {
+  name    = "${local.name}-default"
+  comment = "Origin request policy for S3"
+
+  cookies_config {
+    cookie_behavior = "none"
+  }
+
+  headers_config {
+    header_behavior = "whitelist"
+    headers {
+      items = ["Access-Control-Request-Headers", "Access-Control-Request-Method", "Origin"]
+    }
+  }
+
+  query_strings_config {
+    query_string_behavior = "none"
+  }
+}
+
+################################################################################
 # CloudFront Distribution
 ################################################################################
 
@@ -887,6 +983,7 @@ resource "aws_cloudfront_distribution" "frontend" {
   # Configure custom domain if provided
   aliases = var.frontend_domain != null ? [var.frontend_domain] : []
 
+  # Default cache behavior for index.html and non-hashed files (short cache)
   default_cache_behavior {
     allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
     cached_methods         = ["GET", "HEAD"]
@@ -894,16 +991,44 @@ resource "aws_cloudfront_distribution" "frontend" {
     compress               = true
     viewer_protocol_policy = "redirect-to-https"
 
-    forwarded_values {
-      query_string = false
-      cookies {
-        forward = "none"
-      }
-    }
+    cache_policy_id = aws_cloudfront_cache_policy.default.id
 
-    min_ttl     = 0
-    default_ttl = 3600
-    max_ttl     = 86400
+    # Use origin request policy for better caching
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.default.id
+  }
+
+  # Ordered cache behavior for hashed static assets (long cache)
+  ordered_cache_behavior {
+    path_pattern           = "*.js"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "S3-${aws_s3_bucket.frontend.id}"
+    compress               = true
+    viewer_protocol_policy = "redirect-to-https"
+
+    cache_policy_id = aws_cloudfront_cache_policy.static_assets.id
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "*.css"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "S3-${aws_s3_bucket.frontend.id}"
+    compress               = true
+    viewer_protocol_policy = "redirect-to-https"
+
+    cache_policy_id = aws_cloudfront_cache_policy.static_assets.id
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "assets/*"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "S3-${aws_s3_bucket.frontend.id}"
+    compress               = true
+    viewer_protocol_policy = "redirect-to-https"
+
+    cache_policy_id = aws_cloudfront_cache_policy.static_assets.id
   }
 
   # SPA routing
@@ -936,4 +1061,212 @@ resource "aws_cloudfront_distribution" "frontend" {
   tags = {
     Name = "${local.name}-frontend"
   }
+}
+
+################################################################################
+# CloudFront Invalidation and S3 Cache Control
+################################################################################
+
+# IAM role for CloudFront invalidation (to be used by CI/CD)
+resource "aws_iam_role" "cloudfront_invalidation" {
+  name = "${local.name}-cloudfront-invalidation"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      },
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${local.name}-cloudfront-invalidation"
+  }
+}
+
+# Policy for CloudFront invalidation
+resource "aws_iam_role_policy" "cloudfront_invalidation" {
+  name = "${local.name}-cloudfront-invalidation-policy"
+  role = aws_iam_role.cloudfront_invalidation.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateInvalidation",
+          "cloudfront:GetInvalidation",
+          "cloudfront:ListInvalidations"
+        ]
+        Resource = [
+          aws_cloudfront_distribution.frontend.arn
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:PutObjectAcl",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.frontend.arn,
+          "${aws_s3_bucket.frontend.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+# Lambda function for automatic cache invalidation on S3 changes
+resource "aws_lambda_function" "cache_invalidation" {
+  filename         = "cache_invalidation.zip"
+  function_name    = "${local.name}-cache-invalidation"
+  role            = aws_iam_role.lambda_invalidation.arn
+  handler         = "index.handler"
+  runtime         = "python3.9"
+  timeout         = 60
+
+  environment {
+    variables = {
+      DISTRIBUTION_ID = aws_cloudfront_distribution.frontend.id
+    }
+  }
+
+  tags = {
+    Name = "${local.name}-cache-invalidation"
+  }
+
+  depends_on = [data.archive_file.cache_invalidation_zip]
+}
+
+# IAM role for Lambda function
+resource "aws_iam_role" "lambda_invalidation" {
+  name = "${local.name}-lambda-invalidation"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${local.name}-lambda-invalidation"
+  }
+}
+
+# Policy for Lambda function
+resource "aws_iam_role_policy" "lambda_invalidation" {
+  name = "${local.name}-lambda-invalidation-policy"
+  role = aws_iam_role.lambda_invalidation.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateInvalidation"
+        ]
+        Resource = [
+          aws_cloudfront_distribution.frontend.arn
+        ]
+      }
+    ]
+  })
+}
+
+# Create the Lambda deployment package
+data "archive_file" "cache_invalidation_zip" {
+  type        = "zip"
+  output_path = "cache_invalidation.zip"
+  
+  source {
+    content = <<EOF
+import json
+import boto3
+import os
+
+def handler(event, context):
+    cloudfront = boto3.client('cloudfront')
+    distribution_id = os.environ['DISTRIBUTION_ID']
+    
+    # Create invalidation for index.html and any changed files
+    response = cloudfront.create_invalidation(
+        DistributionId=distribution_id,
+        InvalidationBatch={
+            'Paths': {
+                'Quantity': 2,
+                'Items': [
+                    '/index.html',
+                    '/*'
+                ]
+            },
+            'CallerReference': str(context.aws_request_id)
+        }
+    )
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Cache invalidation created',
+            'invalidationId': response['Invalidation']['Id']
+        })
+    }
+EOF
+    filename = "index.py"
+  }
+}
+
+# S3 bucket notification to trigger Lambda on object changes
+resource "aws_s3_bucket_notification" "frontend_notification" {
+  bucket = aws_s3_bucket.frontend.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.cache_invalidation.arn
+    events              = ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"]
+    filter_prefix       = ""
+    filter_suffix       = ""
+  }
+
+  depends_on = [aws_lambda_permission.allow_s3]
+}
+
+# Permission for S3 to invoke Lambda
+resource "aws_lambda_permission" "allow_s3" {
+  statement_id  = "AllowExecutionFromS3Bucket"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.cache_invalidation.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.frontend.arn
 }

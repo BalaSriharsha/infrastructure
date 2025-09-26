@@ -171,6 +171,16 @@ output "cloudfront_domain_name" {
   value       = aws_cloudfront_distribution.frontend.domain_name
 }
 
+output "cache_invalidation_role_arn" {
+  description = "ARN of the CloudFront cache invalidation role (for CI/CD use)"
+  value       = aws_iam_role.cloudfront_invalidation.arn
+}
+
+output "cache_invalidation_lambda_function_name" {
+  description = "Name of the Lambda function for cache invalidation"
+  value       = aws_lambda_function.cache_invalidation.function_name
+}
+
 ################################################################################
 # Security Group Outputs
 ################################################################################
