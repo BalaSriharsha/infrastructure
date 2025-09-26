@@ -218,3 +218,27 @@ output "vpc_endpoints_security_group_id" {
   description = "ID of the VPC endpoints security group"
   value       = aws_security_group.vpc_endpoints.id
 }
+
+################################################################################
+# WAF Outputs
+################################################################################
+
+output "waf_cloudfront_web_acl_id" {
+  description = "ID of the CloudFront WAF Web ACL"
+  value       = aws_wafv2_web_acl.cloudfront.id
+}
+
+output "waf_cloudfront_web_acl_arn" {
+  description = "ARN of the CloudFront WAF Web ACL"
+  value       = aws_wafv2_web_acl.cloudfront.arn
+}
+
+output "waf_alb_web_acl_id" {
+  description = "ID of the ALB WAF Web ACL"
+  value       = aws_wafv2_web_acl.alb.id
+}
+
+output "waf_alb_web_acl_arn" {
+  description = "ARN of the ALB WAF Web ACL"
+  value       = aws_wafv2_web_acl.alb.arn
+}
