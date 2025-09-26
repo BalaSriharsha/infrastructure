@@ -111,6 +111,8 @@ resource "aws_vpc_endpoint" "secretsmanager" {
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   
+  private_dns_enabled = true
+  
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -118,8 +120,7 @@ resource "aws_vpc_endpoint" "secretsmanager" {
         Effect = "Allow"
         Principal = "*"
         Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret"
+          "secretsmanager:*"
         ]
         Resource = "*"
       }
@@ -139,6 +140,8 @@ resource "aws_vpc_endpoint" "ecr_api" {
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   
+  private_dns_enabled = true
+  
   tags = {
     Name = "${local.name}-ecr-api"
   }
@@ -151,6 +154,8 @@ resource "aws_vpc_endpoint" "ecr_dkr" {
   vpc_endpoint_type   = "Interface"
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  
+  private_dns_enabled = true
   
   tags = {
     Name = "${local.name}-ecr-dkr"
@@ -165,6 +170,8 @@ resource "aws_vpc_endpoint" "logs" {
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   
+  private_dns_enabled = true
+  
   tags = {
     Name = "${local.name}-logs"
   }
@@ -177,6 +184,8 @@ resource "aws_vpc_endpoint" "ecs" {
   vpc_endpoint_type   = "Interface"
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  
+  private_dns_enabled = true
   
   tags = {
     Name = "${local.name}-ecs"
@@ -191,6 +200,8 @@ resource "aws_vpc_endpoint" "ecs_agent" {
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   
+  private_dns_enabled = true
+  
   tags = {
     Name = "${local.name}-ecs-agent"
   }
@@ -203,6 +214,8 @@ resource "aws_vpc_endpoint" "ecs_telemetry" {
   vpc_endpoint_type   = "Interface"
   subnet_ids          = module.vpc.private_subnets
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  
+  private_dns_enabled = true
   
   tags = {
     Name = "${local.name}-ecs-telemetry"
@@ -578,16 +591,14 @@ resource "aws_ecs_task_definition" "app" {
         {
           name  = "SECURITY_GROUP_ID"
           value = aws_security_group.ecs_tasks.id
+        },
+        {
+          name  = "DB_PASSWORD_SECRET_ARN"
+          value = module.rds.db_instance_master_user_secret_arn
         }
       ]
 
-      # Secrets from AWS Secrets Manager
-      secrets = [
-        {
-          name      = "DB_PASSWORD"
-          valueFrom = module.rds.db_instance_master_user_secret_arn
-        }
-      ]
+      # No secrets here - we'll retrieve them at runtime using the SDK
 
       # CloudWatch Logs
       logConfiguration = {
@@ -648,11 +659,24 @@ resource "aws_iam_role_policy" "ecs_execution_secrets_policy" {
       {
         Effect = "Allow"
         Action = [
-          "secretsmanager:GetSecretValue"
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
         ]
         Resource = [
           module.rds.db_instance_master_user_secret_arn
         ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "secretsmanager.${var.aws_region}.amazonaws.com"
+          }
+        }
       }
     ]
   })
