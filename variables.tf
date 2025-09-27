@@ -48,3 +48,47 @@ variable "acm_certificate_arn" {
   type        = string
   default     = null
 }
+
+variable "ecs_autoscaling_min_capacity" {
+  description = "Minimum number of ECS tasks"
+  type        = number
+  default     = 1
+  
+  validation {
+    condition     = var.ecs_autoscaling_min_capacity >= 1 && var.ecs_autoscaling_min_capacity <= 10
+    error_message = "ECS autoscaling minimum capacity must be between 1 and 10."
+  }
+}
+
+variable "ecs_autoscaling_max_capacity" {
+  description = "Maximum number of ECS tasks"
+  type        = number
+  default     = 5
+  
+  validation {
+    condition     = var.ecs_autoscaling_max_capacity >= 1 && var.ecs_autoscaling_max_capacity <= 20
+    error_message = "ECS autoscaling maximum capacity must be between 1 and 20."
+  }
+}
+
+variable "ecs_cpu_target_value" {
+  description = "Target CPU utilization percentage for autoscaling"
+  type        = number
+  default     = 70
+  
+  validation {
+    condition     = var.ecs_cpu_target_value >= 10 && var.ecs_cpu_target_value <= 90
+    error_message = "ECS CPU target value must be between 10 and 90."
+  }
+}
+
+variable "ecs_memory_target_value" {
+  description = "Target memory utilization percentage for autoscaling"
+  type        = number
+  default     = 80
+  
+  validation {
+    condition     = var.ecs_memory_target_value >= 10 && var.ecs_memory_target_value <= 90
+    error_message = "ECS memory target value must be between 10 and 90."
+  }
+}

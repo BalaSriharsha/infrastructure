@@ -476,11 +476,34 @@ resource "aws_lb_target_group" "ecs" {
   }
 }
 
-# Create listener
+# HTTP Listener - Redirect to HTTPS
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = "80"
   protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      protocol    = "HTTPS"
+      port        = "443"
+      status_code = "HTTP_301"
+    }
+  }
+
+  tags = {
+    Name = "${local.name}-http"
+  }
+}
+
+# HTTPS Listener
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS-1-2-2017-01"
+  certificate_arn   = "arn:aws:acm:us-east-1:917186636651:certificate/53f4c4f8-c189-4342-9304-63814c1e2521"
 
   default_action {
     type             = "forward"
@@ -488,7 +511,7 @@ resource "aws_lb_listener" "http" {
   }
 
   tags = {
-    Name = "${local.name}-http"
+    Name = "${local.name}-https"
   }
 }
 
@@ -601,20 +624,80 @@ resource "aws_ecs_task_definition" "app" {
         {
           name  = "DB_PASSWORD_SECRET_ARN"
           value = module.rds.db_instance_master_user_secret_arn
+        },
+        {
+          name  = "_X_AMZN_TRACE_ID"
+          value = ""
+        },
+        {
+          name  = "AWS_XRAY_TRACING_NAME"
+          value = local.name
+        },
+        {
+          name  = "AWS_XRAY_DAEMON_ADDRESS"
+          value = "xray-daemon:2000"
+        },
+        {
+          name  = "AWS_XRAY_CONTEXT_MISSING"
+          value = "LOG_ERROR"
         }
       ]
 
-      # No secrets here - we'll retrieve them at runtime using the SDK
-
-      # CloudWatch Logs
+      # Enhanced CloudWatch Logs Configuration
       logConfiguration = {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = "/ecs/${local.name}"
           "awslogs-region"        = var.aws_region
           "awslogs-stream-prefix" = "ecs"
+          "awslogs-create-group"  = "true"
+          "awslogs-datetime-format" = "%Y-%m-%d %H:%M:%S"
         }
       }
+
+      # Health check
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:${local.container_port}/health || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
+
+      # Resource limits
+      memoryReservation = 512
+      essential         = true
+    },
+    {
+      name  = "xray-daemon"
+      image = "amazon/aws-xray-daemon:latest"
+      
+      portMappings = [
+        {
+          containerPort = 2000
+          protocol      = "udp"
+        }
+      ]
+
+      environment = [
+        {
+          name  = "AWS_REGION"
+          value = var.aws_region
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = "/ecs/${local.name}"
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "xray-daemon"
+          "awslogs-create-group"  = "true"
+        }
+      }
+
+      memoryReservation = 32
+      essential         = false
     }
   ])
 
@@ -652,6 +735,12 @@ resource "aws_iam_role" "ecs_execution_role" {
 resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
   role       = aws_iam_role.ecs_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# Attach X-Ray write access to execution role
+resource "aws_iam_role_policy_attachment" "ecs_execution_xray_policy" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
 }
 
 # Additional policy for Secrets Manager access
@@ -800,6 +889,54 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
   })
 }
 
+# Additional policy for X-Ray and enhanced logging
+resource "aws_iam_role_policy" "ecs_task_xray_logging_policy" {
+  name = "${local.name}-ecs-task-xray-logging-policy"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "xray:PutTraceSegments",
+          "xray:PutTelemetryRecords",
+          "xray:GetSamplingRules",
+          "xray:GetSamplingTargets"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogGroups",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = [
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/${local.name}:*",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/application/${local.name}:*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "MediaMint/Application"
+          }
+        }
+      }
+    ]
+  })
+}
+
 # ECS Service
 resource "aws_ecs_service" "app" {
   name            = local.name
@@ -819,20 +956,272 @@ resource "aws_ecs_service" "app" {
     container_port   = local.container_port
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [
+    aws_lb_listener.http,
+    aws_lb_listener.https
+  ]
 
   tags = {
     Name = local.name
   }
 }
 
-# CloudWatch Log Group
+################################################################################
+# CloudWatch Logging Infrastructure
+################################################################################
+
+# CloudWatch Log Groups
 resource "aws_cloudwatch_log_group" "ecs" {
   name              = "/ecs/${local.name}"
-  retention_in_days = 7
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
 
   tags = {
-    Name = local.name
+    Name = "${local.name}-ecs-logs"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "application" {
+  name              = "/aws/application/${local.name}"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
+
+  tags = {
+    Name = "${local.name}-application-logs"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/${local.name}"
+  retention_in_days = 14
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
+
+  tags = {
+    Name = "${local.name}-lambda-logs"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "rds" {
+  name              = "/aws/rds/instance/${local.name}/error"
+  retention_in_days = 30
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
+
+  tags = {
+    Name = "${local.name}-rds-logs"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "alb" {
+  name              = "/aws/elasticloadbalancing/${local.name}"
+  retention_in_days = 7
+  kms_key_id        = aws_kms_key.cloudwatch_logs.arn
+
+  tags = {
+    Name = "${local.name}-alb-logs"
+  }
+}
+
+# KMS Key for CloudWatch Logs encryption
+resource "aws_kms_key" "cloudwatch_logs" {
+  description             = "KMS key for CloudWatch Logs encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Enable IAM User Permissions"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+      {
+        Sid    = "Allow CloudWatch Logs"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${var.aws_region}.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "kms:EncryptionContext:aws:logs:arn" = [
+              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/${local.name}",
+              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/application/${local.name}",
+              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.name}",
+              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/rds/instance/${local.name}/error",
+              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/elasticloadbalancing/${local.name}"
+            ]
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${local.name}-cloudwatch-logs-kms"
+  }
+}
+
+resource "aws_kms_alias" "cloudwatch_logs" {
+  name          = "alias/${local.name}-cloudwatch-logs"
+  target_key_id = aws_kms_key.cloudwatch_logs.key_id
+}
+
+################################################################################
+# AWS X-Ray Tracing Infrastructure
+################################################################################
+
+# X-Ray Service Map
+resource "aws_xray_sampling_rule" "default" {
+  rule_name      = "${local.name}-default"
+  priority       = 9000
+  version        = 1
+  reservoir_size = 1
+  fixed_rate     = 0.1
+  url_path       = "*"
+  host           = "*"
+  http_method    = "*"
+  service_type   = "*"
+  service_name   = "*"
+  resource_arn   = "*"
+
+  tags = {
+    Name = "${local.name}-xray-sampling"
+  }
+}
+
+# X-Ray Encryption Config
+resource "aws_xray_encryption_config" "default" {
+  type   = "KMS"
+  key_id = aws_kms_key.xray.arn
+}
+
+# KMS Key for X-Ray encryption
+resource "aws_kms_key" "xray" {
+  description             = "KMS key for X-Ray encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Enable IAM User Permissions"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+      {
+        Sid    = "Allow X-Ray Service"
+        Effect = "Allow"
+        Principal = {
+          Service = "xray.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${local.name}-xray-kms"
+  }
+}
+
+resource "aws_kms_alias" "xray" {
+  name          = "alias/${local.name}-xray"
+  target_key_id = aws_kms_key.xray.key_id
+}
+
+################################################################################
+# ECS Auto Scaling
+################################################################################
+
+# Auto Scaling Target
+resource "aws_appautoscaling_target" "ecs_target" {
+  max_capacity       = var.ecs_autoscaling_max_capacity
+  min_capacity       = var.ecs_autoscaling_min_capacity
+  resource_id        = "service/${module.ecs_cluster.name}/${aws_ecs_service.app.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+
+  tags = {
+    Name = "${local.name}-autoscaling-target"
+  }
+}
+
+# CPU-based Auto Scaling Policy
+resource "aws_appautoscaling_policy" "ecs_cpu_policy" {
+  name               = "${local.name}-cpu-scaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+    target_value       = var.ecs_cpu_target_value
+    scale_out_cooldown = 300
+    scale_in_cooldown  = 300
+  }
+}
+
+# Memory-based Auto Scaling Policy
+resource "aws_appautoscaling_policy" "ecs_memory_policy" {
+  name               = "${local.name}-memory-scaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageMemoryUtilization"
+    }
+    target_value       = var.ecs_memory_target_value
+    scale_out_cooldown = 300
+    scale_in_cooldown  = 300
+  }
+}
+
+# ALB Request Count-based Auto Scaling Policy
+resource "aws_appautoscaling_policy" "ecs_request_count_policy" {
+  name               = "${local.name}-request-count-scaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = "${aws_lb.main.arn_suffix}/${aws_lb_target_group.ecs.arn_suffix}"
+    }
+    target_value       = 1000.0
+    scale_out_cooldown = 300
+    scale_in_cooldown  = 300
   }
 }
 
@@ -1511,4 +1900,278 @@ resource "aws_lambda_permission" "allow_s3" {
   function_name = aws_lambda_function.cache_invalidation.function_name
   principal     = "s3.amazonaws.com"
   source_arn    = aws_s3_bucket.frontend.arn
+}
+
+################################################################################
+# CloudWatch Dashboards and Monitoring
+################################################################################
+
+# Main application dashboard
+resource "aws_cloudwatch_dashboard" "main" {
+  dashboard_name = "${local.name}-main"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+
+        properties = {
+          metrics = [
+            ["AWS/ECS", "CPUUtilization", "ServiceName", aws_ecs_service.app.name, "ClusterName", module.ecs_cluster.name],
+            [".", "MemoryUtilization", ".", ".", ".", "."]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.aws_region
+          title   = "ECS Service Metrics"
+          period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
+
+        properties = {
+          metrics = [
+            ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", aws_lb.main.arn_suffix],
+            [".", "TargetResponseTime", ".", "."],
+            [".", "HTTPCode_Target_2XX_Count", ".", "."],
+            [".", "HTTPCode_Target_4XX_Count", ".", "."],
+            [".", "HTTPCode_Target_5XX_Count", ".", "."]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.aws_region
+          title   = "Load Balancer Metrics"
+          period  = 300
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 6
+        width  = 12
+        height = 6
+
+        properties = {
+          metrics = [
+            ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", module.rds.db_instance_identifier],
+            [".", "DatabaseConnections", ".", "."],
+            [".", "FreeableMemory", ".", "."]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.aws_region
+          title   = "RDS Metrics"
+          period  = 300
+        }
+      },
+      {
+        type   = "log"
+        x      = 12
+        y      = 6
+        width  = 12
+        height = 6
+
+        properties = {
+          query   = "SOURCE '/ecs/${local.name}' | fields @timestamp, @message | filter @message like /ERROR/ | sort @timestamp desc | limit 20"
+          region  = var.aws_region
+          title   = "Recent Errors"
+          view    = "table"
+        }
+      }
+    ]
+  })
+}
+
+# X-Ray service map dashboard
+resource "aws_cloudwatch_dashboard" "xray" {
+  dashboard_name = "${local.name}-xray"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 24
+        height = 6
+
+        properties = {
+          metrics = [
+            ["AWS/X-Ray", "TracesReceived"],
+            [".", "TracesProcessed"],
+            [".", "LatencyHigh", "ServiceName", local.name],
+            [".", "ResponseTimeHigh", ".", "."]
+          ]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.aws_region
+          title   = "X-Ray Tracing Metrics"
+          period  = 300
+        }
+      }
+    ]
+  })
+}
+
+################################################################################
+# CloudWatch Alarms
+################################################################################
+
+# High CPU utilization alarm
+resource "aws_cloudwatch_metric_alarm" "ecs_high_cpu" {
+  alarm_name          = "${local.name}-ecs-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ECS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This metric monitors ECS CPU utilization"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    ServiceName = aws_ecs_service.app.name
+    ClusterName = module.ecs_cluster.name
+  }
+
+  tags = {
+    Name = "${local.name}-ecs-high-cpu"
+  }
+}
+
+# High memory utilization alarm
+resource "aws_cloudwatch_metric_alarm" "ecs_high_memory" {
+  alarm_name          = "${local.name}-ecs-high-memory"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "MemoryUtilization"
+  namespace           = "AWS/ECS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "85"
+  alarm_description   = "This metric monitors ECS memory utilization"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    ServiceName = aws_ecs_service.app.name
+    ClusterName = module.ecs_cluster.name
+  }
+
+  tags = {
+    Name = "${local.name}-ecs-high-memory"
+  }
+}
+
+# High response time alarm
+resource "aws_cloudwatch_metric_alarm" "alb_high_response_time" {
+  alarm_name          = "${local.name}-alb-high-response-time"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "TargetResponseTime"
+  namespace           = "AWS/ApplicationELB"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "2"
+  alarm_description   = "This metric monitors ALB response time"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+
+  tags = {
+    Name = "${local.name}-alb-high-response-time"
+  }
+}
+
+# High error rate alarm
+resource "aws_cloudwatch_metric_alarm" "alb_high_error_rate" {
+  alarm_name          = "${local.name}-alb-high-error-rate"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "HTTPCode_Target_5XX_Count"
+  namespace           = "AWS/ApplicationELB"
+  period              = "300"
+  statistic           = "Sum"
+  threshold           = "10"
+  alarm_description   = "This metric monitors ALB 5XX error rate"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+
+  tags = {
+    Name = "${local.name}-alb-high-error-rate"
+  }
+}
+
+# RDS high CPU alarm
+resource "aws_cloudwatch_metric_alarm" "rds_high_cpu" {
+  alarm_name          = "${local.name}-rds-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "This metric monitors RDS CPU utilization"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+
+  dimensions = {
+    DBInstanceIdentifier = module.rds.db_instance_identifier
+  }
+
+  tags = {
+    Name = "${local.name}-rds-high-cpu"
+  }
+}
+
+# SNS topic for alerts
+resource "aws_sns_topic" "alerts" {
+  name = "${local.name}-alerts"
+
+  tags = {
+    Name = "${local.name}-alerts"
+  }
+}
+
+# SNS topic policy
+resource "aws_sns_topic_policy" "alerts" {
+  arn = aws_sns_topic.alerts.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudwatch.amazonaws.com"
+        }
+        Action = "sns:Publish"
+        Resource = aws_sns_topic.alerts.arn
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
 }
