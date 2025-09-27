@@ -49,6 +49,12 @@ variable "acm_certificate_arn" {
   default     = null
 }
 
+variable "backend_domain" {
+  description = "Custom domain for the backend API (optional)"
+  type        = string
+  default     = null
+}
+
 variable "ecs_autoscaling_min_capacity" {
   description = "Minimum number of ECS tasks"
   type        = number

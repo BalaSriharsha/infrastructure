@@ -152,6 +152,11 @@ output "alb_target_group_arn" {
   value       = aws_lb_target_group.ecs.arn
 }
 
+output "backend_url" {
+  description = "Backend API URL (uses custom domain if configured, otherwise ALB DNS name)"
+  value       = var.backend_domain != null ? "https://${var.backend_domain}" : "https://${aws_lb.main.dns_name}"
+}
+
 ################################################################################
 # S3 and CloudFront Outputs
 ################################################################################
